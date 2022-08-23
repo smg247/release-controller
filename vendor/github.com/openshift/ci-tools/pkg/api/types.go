@@ -2,7 +2,10 @@ package api
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	prowv1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
@@ -381,6 +384,24 @@ func (i *ImageStreamTagReference) ISTagName() string {
 	return fmt.Sprintf("%s/%s:%s", i.Namespace, i.Name, i.Tag)
 }
 
+// MultiArchImageStreamTagReference is a ImageStreamTagReference that can resolve
+// the namespace on the runtime based on the os architecture
+type MultiArchImageStreamTagReference struct {
+	ImageStreamTagReference `json:",inline"`
+}
+
+func (m *MultiArchImageStreamTagReference) ResolveNamespace() string {
+	var ret string
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		ret = m.ImageStreamTagReference.Namespace
+	} else {
+		ret = fmt.Sprintf("%s-%s", m.ImageStreamTagReference.Namespace, arch)
+	}
+	logrus.Infof("Resolved multi-arch namespace for %s to %s for %s architecture", m.ImageStreamTagReference.Namespace, ret, arch)
+	return ret
+}
+
 // ReleaseTagConfiguration describes how a release is
 // assembled from release artifacts. A release image stream is a
 // single stream with multiple tags (openshift/origin-v3.9:control-plane),
@@ -437,6 +458,12 @@ type PromotionConfiguration struct {
 	// Tag is the ImageStreamTag tagged in for each
 	// build image's ImageStream.
 	Tag string `json:"tag,omitempty"`
+
+	// TagByCommit determines if an image should be tagged by the
+	// git commit that was used to build it. If Tag is also set,
+	// this will cause both a floating tag and commit-specific tags
+	// to be promoted.
+	TagByCommit bool `json:"tag_by_commit,omitempty"`
 
 	// ExcludedImages are image names that will not be promoted.
 	// Exclusions are made before additional_images are included.
@@ -536,8 +563,8 @@ func (config *InputImageTagStepConfiguration) AddSources(sources ...ImageStreamS
 }
 
 type InputImage struct {
-	BaseImage ImageStreamTagReference         `json:"base_image"`
-	To        PipelineImageStreamTagReference `json:"to,omitempty"`
+	BaseImage MultiArchImageStreamTagReference `json:"base_image"`
+	To        PipelineImageStreamTagReference  `json:"to,omitempty"`
 }
 
 type ImageStreamSourceType string
@@ -819,6 +846,8 @@ type Observer struct {
 	FromImage *ImageStreamTagReference `json:"from_image,omitempty"`
 	// Commands is the command(s) that will be run inside the image.
 	Commands string `json:"commands,omitempty"`
+	// Resources defines the resource requirements for the step.
+	Resources ResourceRequirements `json:"resources,omitempty"`
 }
 
 // Observers is a configuration for which observer pods should and should not
@@ -870,6 +899,10 @@ type LiteralTestStep struct {
 	// to true in MultiStageTestConfiguration. This option is applicable to
 	// `post` steps.
 	BestEffort *bool `json:"best_effort,omitempty"`
+	// NoKubeconfig determines that no $KUBECONFIG will exist in $SHARED_DIR,
+	// so no local copy of it will be created for the step and if the step
+	// creates one, it will not be propagated.
+	NoKubeconfig *bool `json:"no_kubeconfig,omitempty"`
 	// Cli is the (optional) name of the release from which the `oc` binary
 	// will be injected into this step.
 	Cli string `json:"cli,omitempty"`
@@ -1117,6 +1150,7 @@ const (
 	ClusterProfileLibvirtPpc64le        ClusterProfile = "libvirt-ppc64le"
 	ClusterProfileLibvirtS390x          ClusterProfile = "libvirt-s390x"
 	ClusterProfileNutanix               ClusterProfile = "nutanix"
+	ClusterProfileNutanixQE             ClusterProfile = "nutanix-qe"
 	ClusterProfileOpenStack             ClusterProfile = "openstack"
 	ClusterProfileOpenStackHwoffload    ClusterProfile = "openstack-hwoffload"
 	ClusterProfileOpenStackKuryr        ClusterProfile = "openstack-kuryr"
@@ -1126,6 +1160,7 @@ const (
 	ClusterProfileOpenStackOsuosl       ClusterProfile = "openstack-osuosl"
 	ClusterProfileOpenStackVexxhost     ClusterProfile = "openstack-vexxhost"
 	ClusterProfileOpenStackPpc64le      ClusterProfile = "openstack-ppc64le"
+	ClusterProfileOpenStackOpVexxhost   ClusterProfile = "openstack-operators-vexxhost"
 	ClusterProfileOvirt                 ClusterProfile = "ovirt"
 	ClusterProfilePacket                ClusterProfile = "packet"
 	ClusterProfilePacketAssisted        ClusterProfile = "packet-assisted"
@@ -1135,6 +1170,7 @@ const (
 	ClusterProfileVSphereClusterbot     ClusterProfile = "vsphere-clusterbot"
 	ClusterProfileVSpherePlatformNone   ClusterProfile = "vsphere-platform-none"
 	ClusterProfileVSphereMultizone      ClusterProfile = "vsphere-multizone"
+	ClusterProfileVSphereConnected      ClusterProfile = "vsphere-connected"
 	ClusterProfileKubevirt              ClusterProfile = "kubevirt"
 	ClusterProfileAWSCPaaS              ClusterProfile = "aws-cpaas"
 	ClusterProfileOSDEphemeral          ClusterProfile = "osd-ephemeral"
@@ -1189,6 +1225,7 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileLibvirtPpc64le,
 		ClusterProfileLibvirtS390x,
 		ClusterProfileNutanix,
+		ClusterProfileNutanixQE,
 		ClusterProfileOSDEphemeral,
 		ClusterProfileOpenStack,
 		ClusterProfileOpenStackHwoffload,
@@ -1199,6 +1236,7 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileOpenStackOsuosl,
 		ClusterProfileOpenStackPpc64le,
 		ClusterProfileOpenStackVexxhost,
+		ClusterProfileOpenStackOpVexxhost,
 		ClusterProfileOvirt,
 		ClusterProfilePacket,
 		ClusterProfilePacketAssisted,
@@ -1207,6 +1245,7 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSphereDiscon,
 		ClusterProfileVSphereMultizone,
+		ClusterProfileVSphereConnected,
 		ClusterProfileVSpherePlatformNone,
 	}
 }
@@ -1278,6 +1317,8 @@ func (p ClusterProfile) ClusterType() string {
 		return "libvirt-s390x"
 	case ClusterProfileNutanix:
 		return "nutanix"
+	case ClusterProfileNutanixQE:
+		return "nutanix-qe"
 	case ClusterProfileOpenStack:
 		return "openstack"
 	case ClusterProfileOpenStackHwoffload:
@@ -1296,11 +1337,14 @@ func (p ClusterProfile) ClusterType() string {
 		return "openstack-vexxhost"
 	case ClusterProfileOpenStackPpc64le:
 		return "openstack-ppc64le"
+	case ClusterProfileOpenStackOpVexxhost:
+		return "openstack-operators-vexxhost"
 	case
 		ClusterProfileVSphere,
 		ClusterProfileVSphereDiscon,
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSpherePlatformNone,
+		ClusterProfileVSphereConnected,
 		ClusterProfileVSphereMultizone:
 		return "vsphere"
 	case ClusterProfileOvirt:
@@ -1393,6 +1437,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "libvirt-s390x-quota-slice"
 	case ClusterProfileNutanix:
 		return "nutanix-quota-slice"
+	case ClusterProfileNutanixQE:
+		return "nutanix-qe-quota-slice"
 	case ClusterProfileOpenStack:
 		return "openstack-quota-slice"
 	case ClusterProfileOpenStackHwoffload:
@@ -1411,6 +1457,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "openstack-vexxhost-quota-slice"
 	case ClusterProfileOpenStackPpc64le:
 		return "openstack-ppc64le-quota-slice"
+	case ClusterProfileOpenStackOpVexxhost:
+		return "openstack-operators-vexxhost-quota-slice"
 	case ClusterProfileOvirt:
 		return "ovirt-quota-slice"
 	case ClusterProfilePacket:
@@ -1429,6 +1477,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "vsphere-platform-none-quota-slice"
 	case ClusterProfileVSphereMultizone:
 		return "vsphere-multizone-quota-slice"
+	case ClusterProfileVSphereConnected:
+		return "vsphere-connected-quota-slice"
 	case ClusterProfileKubevirt:
 		return "kubevirt-quota-slice"
 	case ClusterProfileAWSCPaaS:
@@ -1490,6 +1540,7 @@ func (p ClusterProfile) Secret() string {
 		ClusterProfileGCPLoggingJournald,
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSphereDiscon,
+		ClusterProfileVSphereConnected,
 		ClusterProfileVSphereMultizone,
 		ClusterProfileVSpherePlatformNone:
 		name = p.ClusterType()
@@ -1502,7 +1553,7 @@ func (p ClusterProfile) Secret() string {
 // LeaseTypeFromClusterType maps cluster types to lease types
 func LeaseTypeFromClusterType(t string) (string, error) {
 	switch t {
-	case "aws", "aws-arm64", "aws-c2s", "aws-china", "aws-usgov", "aws-sc2s", "aws-osd-msp", "alibaba", "azure-2", "azure4", "azure-arc", "azurestack", "azuremag", "equinix-ocp-metal", "gcp", "libvirt-ppc64le", "libvirt-s390x", "nutanix", "openstack", "openstack-osuosl", "openstack-vexxhost", "openstack-ppc64le", "vsphere", "ovirt", "packet", "packet-edge", "powervs", "kubevirt", "aws-cpaas", "osd-ephemeral":
+	case "aws", "aws-arm64", "aws-c2s", "aws-china", "aws-usgov", "aws-sc2s", "aws-osd-msp", "alibaba", "azure-2", "azure4", "azure-arc", "azurestack", "azuremag", "equinix-ocp-metal", "gcp", "libvirt-ppc64le", "libvirt-s390x", "nutanix", "nutanix-qe", "openstack", "openstack-osuosl", "openstack-vexxhost", "openstack-ppc64le", "vsphere", "ovirt", "packet", "packet-edge", "powervs", "kubevirt", "aws-cpaas", "osd-ephemeral":
 		return t + "-quota-slice", nil
 	default:
 		return "", fmt.Errorf("invalid cluster type %q", t)
